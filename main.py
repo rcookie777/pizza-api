@@ -115,6 +115,60 @@ class PizzaIndexData(BaseModel):
     total_restaurants: int
     restaurant_data: Dict[str, Any]
 
+def parse_timestamp_robust(timestamp_str: str) -> datetime:
+    """Parse timestamp string robustly, handling various formats including 5-digit microseconds"""
+    try:
+        # Handle Z suffix
+        if timestamp_str.endswith('Z'):
+            timestamp_str = timestamp_str.replace('Z', '+00:00')
+        elif not timestamp_str.endswith('+00:00'):
+            timestamp_str = timestamp_str + '+00:00'
+        
+        # Try direct parsing first
+        return datetime.fromisoformat(timestamp_str)
+    except ValueError as e:
+        # Handle case where microseconds have 5 digits instead of 6
+        if 'Invalid isoformat string' in str(e) and '.' in timestamp_str:
+            try:
+                # Split on the decimal point
+                base_part, micro_part = timestamp_str.split('.', 1)
+                
+                # Extract microseconds and timezone
+                if '+' in micro_part:
+                    micro_seconds, tz_part = micro_part.split('+', 1)
+                    tz_part = '+' + tz_part
+                else:
+                    micro_seconds = micro_part
+                    tz_part = '+00:00'
+                
+                # Pad microseconds to 6 digits if needed
+                if len(micro_seconds) == 5:
+                    micro_seconds = micro_seconds + '0'
+                elif len(micro_seconds) > 6:
+                    micro_seconds = micro_seconds[:6]
+                
+                # Reconstruct timestamp
+                fixed_timestamp = f"{base_part}.{micro_seconds}{tz_part}"
+                return datetime.fromisoformat(fixed_timestamp)
+            except Exception:
+                pass
+        
+        # If all else fails, try parsing without microseconds
+        try:
+            # Remove microseconds and timezone, then add UTC
+            if '.' in timestamp_str:
+                base_part = timestamp_str.split('.')[0]
+            else:
+                base_part = timestamp_str.split('+')[0].split('Z')[0]
+            
+            # Add UTC timezone
+            base_part += '+00:00'
+            return datetime.fromisoformat(base_part)
+        except Exception:
+            # Last resort: return current time
+            logger.warning(f"Could not parse timestamp: {timestamp_str}, using current time")
+            return datetime.utcnow().replace(tzinfo=timezone.utc)
+
 def get_supabase_headers(use_service_role: bool = False) -> Dict[str, str]:
     """Get headers for Supabase API requests"""
     key = SUPABASE_SERVICE_ROLE_KEY if use_service_role else SUPABASE_ANON_KEY
@@ -203,9 +257,8 @@ def calculate_pizza_index(latest_data: Dict[str, Any], interval: str = 'hour') -
                     minute_ago = current_time - timedelta(minutes=1)
                     period_data = []
                     for d in historical_data:
-                        # Parse timestamp and make it timezone-aware
-                        timestamp_str = d['timestamp'].replace('Z', '+00:00')
-                        item_time = datetime.fromisoformat(timestamp_str)
+                        # Parse timestamp using robust parser
+                        item_time = parse_timestamp_robust(d['timestamp'])
                         # Get data from the previous minute
                         if minute_ago.replace(second=0, microsecond=0) <= item_time < current_time.replace(second=0, microsecond=0):
                             period_data.append(d)
@@ -214,9 +267,8 @@ def calculate_pizza_index(latest_data: Dict[str, Any], interval: str = 'hour') -
                     hour_ago = current_time - timedelta(hours=1)
                     period_data = []
                     for d in historical_data:
-                        # Parse timestamp and make it timezone-aware
-                        timestamp_str = d['timestamp'].replace('Z', '+00:00')
-                        item_time = datetime.fromisoformat(timestamp_str)
+                        # Parse timestamp using robust parser
+                        item_time = parse_timestamp_robust(d['timestamp'])
                         # Get data from the previous hour
                         if hour_ago.replace(minute=0, second=0, microsecond=0) <= item_time < current_time.replace(minute=0, second=0, microsecond=0):
                             period_data.append(d)
@@ -225,9 +277,8 @@ def calculate_pizza_index(latest_data: Dict[str, Any], interval: str = 'hour') -
                     day_ago = current_time - timedelta(days=1)
                     period_data = []
                     for d in historical_data:
-                        # Parse timestamp and make it timezone-aware
-                        timestamp_str = d['timestamp'].replace('Z', '+00:00')
-                        item_time = datetime.fromisoformat(timestamp_str)
+                        # Parse timestamp using robust parser
+                        item_time = parse_timestamp_robust(d['timestamp'])
                         # Get data from the previous day
                         if day_ago.replace(hour=0, minute=0, second=0, microsecond=0) <= item_time < current_time.replace(hour=0, minute=0, second=0, microsecond=0):
                             period_data.append(d)
@@ -387,13 +438,8 @@ async def get_pizza_index_chart_data(
             # Group by minute
             minute_data = {}
             for item in data:
-                # Parse timestamp and make it timezone-aware
-                timestamp_str = item['timestamp']
-                if timestamp_str.endswith('Z'):
-                    timestamp_str = timestamp_str.replace('Z', '+00:00')
-                elif not timestamp_str.endswith('+00:00'):
-                    timestamp_str = timestamp_str + '+00:00'
-                timestamp = datetime.fromisoformat(timestamp_str)
+                # Parse timestamp using robust parser
+                timestamp = parse_timestamp_robust(item['timestamp'])
                 minute_key = timestamp.replace(second=0, microsecond=0)
                 if minute_key not in minute_data:
                     minute_data[minute_key] = []
@@ -426,13 +472,8 @@ async def get_pizza_index_chart_data(
             # Group by hour
             hourly_data = {}
             for item in data:
-                # Parse timestamp and make it timezone-aware
-                timestamp_str = item['timestamp']
-                if timestamp_str.endswith('Z'):
-                    timestamp_str = timestamp_str.replace('Z', '+00:00')
-                elif not timestamp_str.endswith('+00:00'):
-                    timestamp_str = timestamp_str + '+00:00'
-                timestamp = datetime.fromisoformat(timestamp_str)
+                # Parse timestamp using robust parser
+                timestamp = parse_timestamp_robust(item['timestamp'])
                 hour_key = timestamp.replace(minute=0, second=0, microsecond=0)
                 if hour_key not in hourly_data:
                     hourly_data[hour_key] = []
@@ -465,13 +506,8 @@ async def get_pizza_index_chart_data(
             # Group by day
             daily_data = {}
             for item in data:
-                # Parse timestamp and make it timezone-aware
-                timestamp_str = item['timestamp']
-                if timestamp_str.endswith('Z'):
-                    timestamp_str = timestamp_str.replace('Z', '+00:00')
-                elif not timestamp_str.endswith('+00:00'):
-                    timestamp_str = timestamp_str + '+00:00'
-                timestamp = datetime.fromisoformat(timestamp_str)
+                # Parse timestamp using robust parser
+                timestamp = parse_timestamp_robust(item['timestamp'])
                 day_key = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
                 if day_key not in daily_data:
                     daily_data[day_key] = []
@@ -636,7 +672,7 @@ async def get_restaurant_chart_data(
                 # Group by hour
                 hourly_data = {}
                 for item in data:
-                    timestamp = datetime.fromisoformat(item['timestamp'].replace('Z', '+00:00'))
+                    timestamp = parse_timestamp_robust(item['timestamp'])
                     hour_key = timestamp.replace(minute=0, second=0, microsecond=0)
                     
                     if hour_key not in hourly_data:
@@ -675,7 +711,7 @@ async def get_restaurant_chart_data(
                 # Group by day
                 daily_data = {}
                 for item in data:
-                    timestamp = datetime.fromisoformat(item['timestamp'].replace('Z', '+00:00'))
+                    timestamp = parse_timestamp_robust(item['timestamp'])
                     day_key = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
                     
                     if day_key not in daily_data:
