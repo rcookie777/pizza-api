@@ -219,7 +219,10 @@ def main():
         "colony_grill", 
         "wise_guy",
         "night_hawk",
-        "district_pizza"
+        "district_pizza",
+        "we_the_pizza",
+        "dominos_1",
+        "dominos_2"
     ]
     
     tests = [

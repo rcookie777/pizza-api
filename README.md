@@ -1,10 +1,10 @@
 # Restaurant Popular Times API
 
-A FastAPI service that provides access to restaurant popular times data stored in Supabase. This API allows you to query historical data, get the latest information, and view statistics for restaurants around the Pentagon area.
+A FastAPI service that provides access to restaurant popular times data stored in Supabase. This API allows you to query historical data, get the latest information, and view statistics for restaurants around the Arlington area.
 
-## 🍕 Pentagon Pizza Index
+## 🍕 Pizza Index
 
-The API now includes a **Pentagon Pizza Index** that aggregates real-time data from 5 major pizza establishments around the Pentagon:
+The API now includes a **Pizza Index** that aggregates real-time data from 5 major pizza establishments around Arlington:
 
 - **Extreme Pizza** - 1419 S Fern St, Arlington, VA 22202
 - **Colony Grill** - 2800 Clarendon Blvd, Arlington, VA 22201  
@@ -12,11 +12,11 @@ The API now includes a **Pentagon Pizza Index** that aggregates real-time data f
 - **Night Hawk Brewery & Pizza** - 1201 S Joyce St, Ste C10, Arlington, VA 22202
 - **District Pizza Palace** - 2325 S Eads St, Arlington, VA 22202
 
-The index calculates a real-time value based on current popularity data from all restaurants, providing insights into pizza demand patterns around the Pentagon.
+The index calculates a real-time value based on current popularity data from all restaurants, providing insights into pizza demand patterns around Arlington.
 
 ## Features
 
-- **🍕 Pentagon Pizza Index**: Real-time aggregated index from 5 pizza establishments
+- **🍕 Pizza Index**: Real-time aggregated index from 5 pizza establishments
 - **📊 Live Data**: Current popularity, ratings, and wait times
 - **📈 Historical Charts**: Hourly and daily historical data for trend analysis
 - **🏪 Individual Restaurant Data**: Detailed data for each establishment
@@ -29,7 +29,7 @@ The index calculates a real-time value based on current popularity data from all
 ## API Endpoints
 
 ### 🍕 Pizza Index (New!)
-- `GET /pizza-index/live` - Get live Pentagon Pizza Index data
+- `GET /pizza-index/live` - Get live Pizza Index data
 - `GET /pizza-index/chart-data` - Get historical chart data for the index
 
 ### Health & Status
@@ -216,12 +216,12 @@ Once the API is running, you can access:
 {
   "index": {
     "id": "pizza",
-    "name": "Pentagon Pizza Index",
+            "name": "Pizza Index",
     "symbol": "PZZA",
     "value": 156.8,
     "change": 2.3,
     "changePercent": 1.49,
-    "description": "Real-time pizza demand index around the Pentagon",
+            "description": "Real-time pizza demand index around Arlington",
     "methodology": "Aggregates current popularity data from major pizza establishments...",
     "dataSources": ["Google Maps Popular Times", "Real-time Restaurant Data"]
   },
