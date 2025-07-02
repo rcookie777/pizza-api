@@ -37,8 +37,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://monitorthesituation.lol",
-        # "http://localhost:8080",  # for Vite/React dev server
-        # "http://localhost:3000",  # for Create React App/Next.js dev server
+        "http://localhost:8080",  # for Vite/React dev server
+        "http://localhost:3000",  # for Create React App/Next.js dev server
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -448,7 +448,7 @@ async def get_pizza_index_chart_data(
     days: int = Query(30, description="Number of days of historical data"),
     interval: str = Query("hour", description="Data interval: minute, hour, day")
 ):
-    """Get historical chart data for the Pizza Index - Optimized with auto-pagination and caching"""
+    """Get historical chart data for the Pizza Index - FAST: uses pre-aggregated table"""
     start_time = datetime.utcnow().timestamp()
     try:
         # Check cache first
@@ -465,127 +465,37 @@ async def get_pizza_index_chart_data(
         logger.info(f"Cutoff date: {cutoff_date}")
         logger.info(f"Current time: {datetime.utcnow().replace(tzinfo=timezone.utc)}")
         
-        # Auto-pagination: fetch all records in chunks
-        all_data = []
-        page_size = 1000
-        offset = 0
-        while True:
-            url = f"{SUPABASE_URL}/rest/v1/restaurant_popular_times"
-            params = {
-                'timestamp': f'gte.{cutoff_date.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}',
-                'order': 'timestamp.asc',
-                'limit': str(page_size),
-                'offset': str(offset)
+        # Fetch from pre-aggregated table
+        url = f"{SUPABASE_URL}/rest/v1/pizza_index_aggregates"
+        params = {
+            'interval': f'eq.{interval}',
+            'timestamp': f'gte.{cutoff_date.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}',
+            'order': 'timestamp.asc',
+        }
+        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+        url = f"{url}?{query_string}"
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            logger.error(f"Supabase API error: {response.status_code} - {response.text}")
+            raise HTTPException(status_code=500, detail="Database error")
+        data = response.json()
+        logger.info(f"Retrieved {len(data)} records from pizza_index_aggregates table")
+        # Format for frontend
+        chart_data = [
+            {
+                "timestamp": item["timestamp"],
+                "value": item["value"],
+                "avg_popularity": item.get("avg_popularity", 0),
+                "data_points": item.get("data_points", 0),
             }
-            query_string = "&".join([f"{k}={v}" for k, v in params.items()])
-            page_url = f"{url}?{query_string}"
-            response = requests.get(page_url, headers=headers)
-            if response.status_code == 200:
-                page_data = response.json()
-                if not page_data:
-                    break
-                all_data.extend(page_data)
-                offset += page_size
-                if len(page_data) < page_size:
-                    break
-            else:
-                logger.error(f"Supabase API error: {response.status_code} - {response.text}")
-                raise HTTPException(status_code=500, detail="Database error")
-        data = all_data
-        logger.info(f"Retrieved {len(data)} records from database (auto-paginated)")
-        # Smart sampling and aggregation (same as before)
-        chart_data = []
-        if interval == "minute":
-            minute_data = {}
-            for item in data:
-                timestamp = parse_timestamp_robust(item['timestamp'])
-                minute_key = timestamp.replace(second=0, microsecond=0)
-                if minute_key not in minute_data:
-                    minute_data[minute_key] = []
-                minute_data[minute_key].append(item)
-            sampled_minutes = sorted(minute_data.keys())[::5]
-            for minute in sampled_minutes:
-                items = minute_data[minute]
-                total_popularity = 0
-                valid_count = 0
-                restaurant_count = 0
-                for item in items:
-                    restaurant_count += 1
-                    if item.get('current_popularity') is not None:
-                        total_popularity += item['current_popularity']
-                        valid_count += 1
-                if valid_count > 0:
-                    avg_popularity = total_popularity / valid_count
-                    index_value = 100 + (avg_popularity * 0.8)
-                    chart_data.append({
-                        "timestamp": minute.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                        "value": round(index_value, 1),
-                        "avg_popularity": round(avg_popularity, 1),
-                        "data_points": valid_count,
-                        "total_restaurants": restaurant_count
-                    })
-        elif interval == "hour":
-            hourly_data = {}
-            for item in data:
-                timestamp = parse_timestamp_robust(item['timestamp'])
-                hour_key = timestamp.replace(minute=0, second=0, microsecond=0)
-                if hour_key not in hourly_data:
-                    hourly_data[hour_key] = []
-                hourly_data[hour_key].append(item)
-            sampled_hours = sorted(hourly_data.keys())[::2]
-            for hour in sampled_hours:
-                items = hourly_data[hour]
-                total_popularity = 0
-                valid_count = 0
-                restaurant_count = 0
-                for item in items:
-                    restaurant_count += 1
-                    if item.get('current_popularity') is not None:
-                        total_popularity += item['current_popularity']
-                        valid_count += 1
-                if valid_count > 0:
-                    avg_popularity = total_popularity / valid_count
-                    index_value = 100 + (avg_popularity * 0.8)
-                    chart_data.append({
-                        "timestamp": hour.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                        "value": round(index_value, 1),
-                        "avg_popularity": round(avg_popularity, 1),
-                        "data_points": valid_count,
-                        "total_restaurants": restaurant_count
-                    })
-        elif interval == "day":
-            daily_data = {}
-            for item in data:
-                timestamp = parse_timestamp_robust(item['timestamp'])
-                day_key = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
-                if day_key not in daily_data:
-                    daily_data[day_key] = []
-                daily_data[day_key].append(item)
-            for day, items in sorted(daily_data.items()):
-                total_popularity = 0
-                valid_count = 0
-                restaurant_count = 0
-                for item in items:
-                    restaurant_count += 1
-                    if item.get('current_popularity') is not None:
-                        total_popularity += item['current_popularity']
-                        valid_count += 1
-                if valid_count > 0:
-                    avg_popularity = total_popularity / valid_count
-                    index_value = 100 + (avg_popularity * 0.8)
-                    chart_data.append({
-                        "timestamp": day.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                        "value": round(index_value, 1),
-                        "avg_popularity": round(avg_popularity, 1),
-                        "data_points": valid_count,
-                        "total_restaurants": restaurant_count
-                    })
+            for item in data
+        ]
         response_data = {
             "chart_data": chart_data,
             "period_days": days,
             "interval": interval,
             "total_data_points": len(data),
-            "optimization": "auto_pagination"
+            "optimization": "pre_aggregated"
         }
         set_cached_response(cache_key, response_data)
         update_performance_stats(datetime.utcnow().timestamp() - start_time)
@@ -847,9 +757,9 @@ async def get_restaurant_latest(restaurant_id: str):
 async def get_restaurant_chart_data(
     restaurant_id: str,
     days: int = Query(7, description="Number of days of historical data"),
-    interval: str = Query("hour", description="Data interval: hour, day")
+    interval: str = Query("hour", description="Data interval: minute, hour, day")
 ):
-    """Get historical chart data for a specific restaurant - Optimized with smart sampling"""
+    """Get historical chart data for a specific restaurant - Shows ALL available data"""
     if restaurant_id not in RESTAURANTS:
         raise HTTPException(status_code=404, detail="Restaurant not found")
     
@@ -858,135 +768,181 @@ async def get_restaurant_chart_data(
         
         cutoff_date = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(days=days)
         
-        # Optimize data retrieval based on interval
-        if interval == "hour":
-            # For hour intervals, limit to reasonable amount
+        # Get ALL data for the time period with pagination to handle large datasets
+        all_data = []
+        page_size = 1000
+        offset = 0
+        
+        while True:
             url = f"{SUPABASE_URL}/rest/v1/restaurant_popular_times"
             params = {
                 'restaurant_id': f'eq.{restaurant_id}',
                 'timestamp': f'gte.{cutoff_date.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}',
                 'order': 'timestamp.asc',
-                'limit': '2000'  # Reasonable limit for hourly data
+                'limit': str(page_size),
+                'offset': str(offset)
             }
+            
+            query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+            url += f"?{query_string}"
+            
+            response = requests.get(url, headers=headers)
+            
+            if response.status_code == 200:
+                page_data = response.json()
+                if not page_data:  # No more data
+                    break
+                    
+                all_data.extend(page_data)
+                offset += page_size
+                
+                # If we got less than page_size, we've reached the end
+                if len(page_data) < page_size:
+                    break
+            else:
+                logger.error(f"Supabase API error: {response.status_code} - {response.text}")
+                raise HTTPException(status_code=500, detail="Database error")
+        
+        data = all_data
+        logger.info(f"Retrieved {len(data)} total records for restaurant {restaurant_id} (complete dataset)")
+        
+        if interval not in ["minute", "hour", "day"]:
+            raise HTTPException(status_code=400, detail="Invalid interval. Must be 'minute', 'hour', or 'day'")
+        
+        # Group data by timestamp intervals
+        chart_data = []
+        
+        if interval == "minute":
+            # Group by minute - show all minutes with data
+            minute_data = {}
+            for item in data:
+                timestamp = parse_timestamp_robust(item['timestamp'])
+                minute_key = timestamp.replace(second=0, microsecond=0)
+                
+                if minute_key not in minute_data:
+                    minute_data[minute_key] = []
+                minute_data[minute_key].append(item)
+            
+            # Calculate metrics for ALL minutes (no sampling)
+            for minute, items in sorted(minute_data.items()):
+                if items:
+                    # Find the most recent item with valid popularity data
+                    valid_items = [item for item in items if item.get('current_popularity') is not None]
+                    
+                    if valid_items:
+                        # Use the latest valid data point for this minute
+                        latest_item = valid_items[-1]
+                        chart_data.append({
+                            "timestamp": minute.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                            "popularity": latest_item.get('current_popularity', 0),
+                            "rating": latest_item.get('rating'),
+                            "data_points": len(valid_items),
+                            "total_attempts": len(items),
+                            "data_quality": len(valid_items) / len(items) if items else 0
+                        })
+                    else:
+                        # No valid data for this minute, but we know we tried
+                        chart_data.append({
+                            "timestamp": minute.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                            "popularity": None,
+                            "rating": None,
+                            "data_points": 0,
+                            "total_attempts": len(items),
+                            "data_quality": 0,
+                            "status": "no_data"
+                        })
+        
+        elif interval == "hour":
+            # Group by hour - NO SAMPLING, show all hours with data
+            hourly_data = {}
+            for item in data:
+                timestamp = parse_timestamp_robust(item['timestamp'])
+                hour_key = timestamp.replace(minute=0, second=0, microsecond=0)
+                
+                if hour_key not in hourly_data:
+                    hourly_data[hour_key] = []
+                hourly_data[hour_key].append(item)
+            
+            # Calculate metrics for ALL hours (no sampling)
+            for hour, items in sorted(hourly_data.items()):
+                if items:
+                    # Find the most recent item with valid popularity data
+                    valid_items = [item for item in items if item.get('current_popularity') is not None]
+                    
+                    if valid_items:
+                        # Use the latest valid data point for this hour
+                        latest_item = valid_items[-1]
+                        chart_data.append({
+                            "timestamp": hour.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                            "popularity": latest_item.get('current_popularity', 0),
+                            "rating": latest_item.get('rating'),
+                            "data_points": len(valid_items),
+                            "total_attempts": len(items),
+                            "data_quality": len(valid_items) / len(items) if items else 0
+                        })
+                    else:
+                        # No valid data for this hour, but we know we tried
+                        chart_data.append({
+                            "timestamp": hour.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                            "popularity": None,
+                            "rating": None,
+                            "data_points": 0,
+                            "total_attempts": len(items),
+                            "data_quality": 0,
+                            "status": "no_data"
+                        })
+        
         elif interval == "day":
-            # For day intervals, be more selective
-            url = f"{SUPABASE_URL}/rest/v1/restaurant_popular_times"
-            params = {
-                'restaurant_id': f'eq.{restaurant_id}',
-                'timestamp': f'gte.{cutoff_date.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}',
-                'order': 'timestamp.asc',
-                'limit': '500'  # Small limit for daily data
-            }
-        else:
-            raise HTTPException(status_code=400, detail="Invalid interval. Must be 'hour' or 'day'")
-        
-        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
-        url += f"?{query_string}"
-        
-        response = requests.get(url, headers=headers)
-        
-        if response.status_code == 200:
-            data = response.json()
-            logger.info(f"Retrieved {len(data)} records for restaurant {restaurant_id} (optimized)")
+            # Group by day - show ALL days with data
+            daily_data = {}
+            for item in data:
+                timestamp = parse_timestamp_robust(item['timestamp'])
+                day_key = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+                
+                if day_key not in daily_data:
+                    daily_data[day_key] = []
+                daily_data[day_key].append(item)
             
-            # Group data by timestamp intervals
-            chart_data = []
-            
-            if interval == "hour":
-                # Group by hour with smart sampling
-                hourly_data = {}
-                for item in data:
-                    timestamp = parse_timestamp_robust(item['timestamp'])
-                    hour_key = timestamp.replace(minute=0, second=0, microsecond=0)
+            # Calculate metrics for each day
+            for day, items in sorted(daily_data.items()):
+                if items:
+                    # Find the most recent item with valid popularity data
+                    valid_items = [item for item in items if item.get('current_popularity') is not None]
                     
-                    if hour_key not in hourly_data:
-                        hourly_data[hour_key] = []
-                    hourly_data[hour_key].append(item)
-                
-                # Sample every 2 hours to reduce data points for better performance
-                sampled_hours = sorted(hourly_data.keys())[::2]
-                
-                # Calculate metrics for each sampled hour
-                for hour in sampled_hours:
-                    items = hourly_data[hour]
-                    if items:
-                        # Find the most recent item with valid popularity data
-                        valid_items = [item for item in items if item.get('current_popularity') is not None]
-                        
-                        if valid_items:
-                            latest_item = valid_items[-1]  # Most recent valid item
-                            chart_data.append({
-                                "timestamp": hour.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                                "popularity": latest_item.get('current_popularity', 0),
-                                "rating": latest_item.get('rating'),
-                                "data_points": len(valid_items),
-                                "total_attempts": len(items),
-                                "data_quality": len(valid_items) / len(items) if items else 0
-                            })
-                        else:
-                            # No valid data for this hour, but we know we tried
-                            chart_data.append({
-                                "timestamp": hour.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                                "popularity": None,
-                                "rating": None,
-                                "data_points": 0,
-                                "total_attempts": len(items),
-                                "data_quality": 0,
-                                "status": "no_data"
-                            })
-            
-            elif interval == "day":
-                # Group by day
-                daily_data = {}
-                for item in data:
-                    timestamp = parse_timestamp_robust(item['timestamp'])
-                    day_key = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
-                    
-                    if day_key not in daily_data:
-                        daily_data[day_key] = []
-                    daily_data[day_key].append(item)
-                
-                # Calculate metrics for each day
-                for day, items in sorted(daily_data.items()):
-                    if items:
-                        # Find the most recent item with valid popularity data
-                        valid_items = [item for item in items if item.get('current_popularity') is not None]
-                        
-                        if valid_items:
-                            latest_item = valid_items[-1]  # Most recent valid item
-                            chart_data.append({
-                                "timestamp": day.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                                "popularity": latest_item.get('current_popularity', 0),
-                                "rating": latest_item.get('rating'),
-                                "data_points": len(valid_items),
-                                "total_attempts": len(items),
-                                "data_quality": len(valid_items) / len(items) if items else 0
-                            })
-                        else:
-                            # No valid data for this day, but we know we tried
-                            chart_data.append({
-                                "timestamp": day.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                                "popularity": None,
-                                "rating": None,
-                                "data_points": 0,
-                                "total_attempts": len(items),
-                                "data_quality": 0,
-                                "status": "no_data"
-                            })
-            
-            return {
-                "restaurant_id": restaurant_id,
-                "restaurant_name": RESTAURANTS[restaurant_id]["name"],
-                "chart_data": chart_data,
-                "period_days": days,
-                "interval": interval,
-                "total_data_points": len(data),
-                "optimization": "smart_sampling"
-            }
-        else:
-            logger.error(f"Supabase API error: {response.status_code} - {response.text}")
-            raise HTTPException(status_code=500, detail="Database error")
-            
+                    if valid_items:
+                        # Use the latest valid data point for this day
+                        latest_item = valid_items[-1]
+                        chart_data.append({
+                            "timestamp": day.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                            "popularity": latest_item.get('current_popularity', 0),
+                            "rating": latest_item.get('rating'),
+                            "data_points": len(valid_items),
+                            "total_attempts": len(items),
+                            "data_quality": len(valid_items) / len(items) if items else 0
+                        })
+                    else:
+                        # No valid data for this day, but we know we tried
+                        chart_data.append({
+                            "timestamp": day.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                            "popularity": None,
+                            "rating": None,
+                            "data_points": 0,
+                            "total_attempts": len(items),
+                            "data_quality": 0,
+                            "status": "no_data"
+                        })
+        
+        return {
+            "restaurant_id": restaurant_id,
+            "restaurant_name": RESTAURANTS[restaurant_id]["name"],
+            "chart_data": chart_data,
+            "period_days": days,
+            "interval": interval,
+            "total_data_points": len(data),
+            "chart_data_points": len(chart_data),
+            "optimization": "complete_dataset"
+        }
+        
     except Exception as e:
         logger.error(f"Error generating restaurant chart data: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
