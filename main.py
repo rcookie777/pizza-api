@@ -35,7 +35,11 @@ app = FastAPI(
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://monitorthesituation.lol"],  # Only allow your frontend domain
+    allow_origins=[
+        "https://monitorthesituation.lol",
+        # "http://localhost:8080",  # for Vite/React dev server
+        # "http://localhost:3000",  # for Create React App/Next.js dev server
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -114,6 +118,55 @@ class PizzaIndexData(BaseModel):
     active_restaurants: int
     total_restaurants: int
     restaurant_data: Dict[str, Any]
+
+# Global state for health checks
+last_collection_time = None
+collection_count = 0
+is_running = False
+
+# Request deduplication cache
+request_cache = {}
+CACHE_TTL = 60  # 60 seconds cache TTL
+
+# Performance monitoring
+performance_stats = {
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "total_requests": 0,
+    "avg_response_time": 0,
+    "last_reset": datetime.utcnow().timestamp()
+}
+
+def get_cached_response(cache_key: str):
+    """Get cached response if it exists and is not expired"""
+    if cache_key in request_cache:
+        cached_data, timestamp = request_cache[cache_key]
+        if datetime.utcnow().timestamp() - timestamp < CACHE_TTL:
+            performance_stats["cache_hits"] += 1
+            return cached_data
+        else:
+            # Remove expired cache entry
+            del request_cache[cache_key]
+    performance_stats["cache_misses"] += 1
+    return None
+
+def set_cached_response(cache_key: str, data: dict):
+    """Cache response with timestamp"""
+    request_cache[cache_key] = (data, datetime.utcnow().timestamp())
+
+def get_cache_key(endpoint: str, **params) -> str:
+    """Generate cache key from endpoint and parameters"""
+    param_str = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+    return f"{endpoint}:{param_str}"
+
+def update_performance_stats(response_time: float):
+    """Update performance statistics"""
+    performance_stats["total_requests"] += 1
+    current_avg = performance_stats["avg_response_time"]
+    total_requests = performance_stats["total_requests"]
+    
+    # Calculate new average
+    performance_stats["avg_response_time"] = (current_avg * (total_requests - 1) + response_time) / total_requests
 
 def parse_timestamp_robust(timestamp_str: str) -> datetime:
     """Parse timestamp string robustly, handling various formats including 5-digit microseconds"""
@@ -345,13 +398,20 @@ async def get_restaurants():
 async def get_pizza_index_live(interval: str = Query("hour", description="Time interval for change calculation: minute, hour, day")):
     """Get live Pizza Index data"""
     try:
+        # Check cache first (shorter TTL for live data)
+        cache_key = get_cache_key("pizza_index_live", interval=interval)
+        cached_response = get_cached_response(cache_key)
+        if cached_response:
+            logger.info(f"Returning cached live data for {interval} interval")
+            return cached_response
+        
         # Get latest data for all restaurants
         all_latest = await get_all_latest_data()
         
         # Calculate the pizza index with the specified interval
         pizza_index = calculate_pizza_index(all_latest, interval)
         
-        return {
+        response_data = {
             "index": {
                 "id": "pizza",
                 "name": "Pizza Index",
@@ -359,7 +419,7 @@ async def get_pizza_index_live(interval: str = Query("hour", description="Time i
                 "value": pizza_index.value,
                 "change": pizza_index.change,
                 "changePercent": pizza_index.changePercent,
-                "description": "Real-time pizza demand",
+                "description": "Aggregated popularity of pizza establishments in the Arlington area.",
                 "methodology": "Aggregates current popularity data from major pizza establishments around the arlington area. Higher values indicate increased demand and potential economic activity.",
                 "dataSources": ["Google Maps Popular Times", "Real-time Restaurant Data"]
             },
@@ -374,6 +434,11 @@ async def get_pizza_index_live(interval: str = Query("hour", description="Time i
             "restaurants": pizza_index.restaurant_data
         }
         
+        # Cache the response
+        set_cached_response(cache_key, response_data)
+        
+        return response_data
+        
     except Exception as e:
         logger.error(f"Error calculating pizza index: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -383,16 +448,160 @@ async def get_pizza_index_chart_data(
     days: int = Query(30, description="Number of days of historical data"),
     interval: str = Query("hour", description="Data interval: minute, hour, day")
 ):
-    """Get historical chart data for the Pizza Index"""
+    """Get historical chart data for the Pizza Index - Optimized with auto-pagination and caching"""
+    start_time = datetime.utcnow().timestamp()
+    try:
+        # Check cache first
+        cache_key = get_cache_key("pizza_index_chart", days=days, interval=interval)
+        cached_response = get_cached_response(cache_key)
+        if cached_response:
+            logger.info(f"Returning cached chart data for {interval} interval")
+            update_performance_stats(datetime.utcnow().timestamp() - start_time)
+            return cached_response
+        
+        headers = get_supabase_headers(use_service_role=True)
+        cutoff_date = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(days=days)
+        logger.info(f"Chart data request: days={days}, interval={interval}")
+        logger.info(f"Cutoff date: {cutoff_date}")
+        logger.info(f"Current time: {datetime.utcnow().replace(tzinfo=timezone.utc)}")
+        
+        # Auto-pagination: fetch all records in chunks
+        all_data = []
+        page_size = 1000
+        offset = 0
+        while True:
+            url = f"{SUPABASE_URL}/rest/v1/restaurant_popular_times"
+            params = {
+                'timestamp': f'gte.{cutoff_date.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}',
+                'order': 'timestamp.asc',
+                'limit': str(page_size),
+                'offset': str(offset)
+            }
+            query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+            page_url = f"{url}?{query_string}"
+            response = requests.get(page_url, headers=headers)
+            if response.status_code == 200:
+                page_data = response.json()
+                if not page_data:
+                    break
+                all_data.extend(page_data)
+                offset += page_size
+                if len(page_data) < page_size:
+                    break
+            else:
+                logger.error(f"Supabase API error: {response.status_code} - {response.text}")
+                raise HTTPException(status_code=500, detail="Database error")
+        data = all_data
+        logger.info(f"Retrieved {len(data)} records from database (auto-paginated)")
+        # Smart sampling and aggregation (same as before)
+        chart_data = []
+        if interval == "minute":
+            minute_data = {}
+            for item in data:
+                timestamp = parse_timestamp_robust(item['timestamp'])
+                minute_key = timestamp.replace(second=0, microsecond=0)
+                if minute_key not in minute_data:
+                    minute_data[minute_key] = []
+                minute_data[minute_key].append(item)
+            sampled_minutes = sorted(minute_data.keys())[::5]
+            for minute in sampled_minutes:
+                items = minute_data[minute]
+                total_popularity = 0
+                valid_count = 0
+                restaurant_count = 0
+                for item in items:
+                    restaurant_count += 1
+                    if item.get('current_popularity') is not None:
+                        total_popularity += item['current_popularity']
+                        valid_count += 1
+                if valid_count > 0:
+                    avg_popularity = total_popularity / valid_count
+                    index_value = 100 + (avg_popularity * 0.8)
+                    chart_data.append({
+                        "timestamp": minute.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                        "value": round(index_value, 1),
+                        "avg_popularity": round(avg_popularity, 1),
+                        "data_points": valid_count,
+                        "total_restaurants": restaurant_count
+                    })
+        elif interval == "hour":
+            hourly_data = {}
+            for item in data:
+                timestamp = parse_timestamp_robust(item['timestamp'])
+                hour_key = timestamp.replace(minute=0, second=0, microsecond=0)
+                if hour_key not in hourly_data:
+                    hourly_data[hour_key] = []
+                hourly_data[hour_key].append(item)
+            sampled_hours = sorted(hourly_data.keys())[::2]
+            for hour in sampled_hours:
+                items = hourly_data[hour]
+                total_popularity = 0
+                valid_count = 0
+                restaurant_count = 0
+                for item in items:
+                    restaurant_count += 1
+                    if item.get('current_popularity') is not None:
+                        total_popularity += item['current_popularity']
+                        valid_count += 1
+                if valid_count > 0:
+                    avg_popularity = total_popularity / valid_count
+                    index_value = 100 + (avg_popularity * 0.8)
+                    chart_data.append({
+                        "timestamp": hour.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                        "value": round(index_value, 1),
+                        "avg_popularity": round(avg_popularity, 1),
+                        "data_points": valid_count,
+                        "total_restaurants": restaurant_count
+                    })
+        elif interval == "day":
+            daily_data = {}
+            for item in data:
+                timestamp = parse_timestamp_robust(item['timestamp'])
+                day_key = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+                if day_key not in daily_data:
+                    daily_data[day_key] = []
+                daily_data[day_key].append(item)
+            for day, items in sorted(daily_data.items()):
+                total_popularity = 0
+                valid_count = 0
+                restaurant_count = 0
+                for item in items:
+                    restaurant_count += 1
+                    if item.get('current_popularity') is not None:
+                        total_popularity += item['current_popularity']
+                        valid_count += 1
+                if valid_count > 0:
+                    avg_popularity = total_popularity / valid_count
+                    index_value = 100 + (avg_popularity * 0.8)
+                    chart_data.append({
+                        "timestamp": day.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                        "value": round(index_value, 1),
+                        "avg_popularity": round(avg_popularity, 1),
+                        "data_points": valid_count,
+                        "total_restaurants": restaurant_count
+                    })
+        response_data = {
+            "chart_data": chart_data,
+            "period_days": days,
+            "interval": interval,
+            "total_data_points": len(data),
+            "optimization": "auto_pagination"
+        }
+        set_cached_response(cache_key, response_data)
+        update_performance_stats(datetime.utcnow().timestamp() - start_time)
+        return response_data
+    except Exception as e:
+        logger.error(f"Error generating chart data: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+async def get_pizza_index_chart_data_fallback(days: int, interval: str):
+    """Fallback method using the original in-memory processing approach"""
     try:
         headers = get_supabase_headers(use_service_role=True)
         
         cutoff_date = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(days=days)
         
-        # Add debug logging
-        logger.info(f"Chart data request: days={days}, interval={interval}")
-        logger.info(f"Cutoff date: {cutoff_date}")
-        logger.info(f"Current time: {datetime.utcnow().replace(tzinfo=timezone.utc)}")
+        logger.info(f"Using fallback method for chart data: days={days}, interval={interval}")
         
         # Get all data for the time period with pagination to handle large datasets
         all_data = []
@@ -429,7 +638,7 @@ async def get_pizza_index_chart_data(
                 raise HTTPException(status_code=500, detail="Database error")
         
         data = all_data
-        logger.info(f"Retrieved {len(data)} total records from database")
+        logger.info(f"Retrieved {len(data)} total records from database (fallback)")
             
         # Group data by timestamp intervals
         chart_data = []
@@ -544,7 +753,7 @@ async def get_pizza_index_chart_data(
             "total_data_points": len(data)
         }
     except Exception as e:
-        logger.error(f"Error generating chart data: {e}")
+        logger.error(f"Error in fallback chart data generation: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/restaurant/{restaurant_id}/data", response_model=List[RestaurantData])
@@ -640,7 +849,7 @@ async def get_restaurant_chart_data(
     days: int = Query(7, description="Number of days of historical data"),
     interval: str = Query("hour", description="Data interval: hour, day")
 ):
-    """Get historical chart data for a specific restaurant"""
+    """Get historical chart data for a specific restaurant - Optimized with smart sampling"""
     if restaurant_id not in RESTAURANTS:
         raise HTTPException(status_code=404, detail="Restaurant not found")
     
@@ -649,13 +858,27 @@ async def get_restaurant_chart_data(
         
         cutoff_date = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(days=days)
         
-        # Get data for the specific restaurant
-        url = f"{SUPABASE_URL}/rest/v1/restaurant_popular_times"
-        params = {
-            'restaurant_id': f'eq.{restaurant_id}',
-            'timestamp': f'gte.{cutoff_date.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}',
-            'order': 'timestamp.asc'
-        }
+        # Optimize data retrieval based on interval
+        if interval == "hour":
+            # For hour intervals, limit to reasonable amount
+            url = f"{SUPABASE_URL}/rest/v1/restaurant_popular_times"
+            params = {
+                'restaurant_id': f'eq.{restaurant_id}',
+                'timestamp': f'gte.{cutoff_date.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}',
+                'order': 'timestamp.asc',
+                'limit': '2000'  # Reasonable limit for hourly data
+            }
+        elif interval == "day":
+            # For day intervals, be more selective
+            url = f"{SUPABASE_URL}/rest/v1/restaurant_popular_times"
+            params = {
+                'restaurant_id': f'eq.{restaurant_id}',
+                'timestamp': f'gte.{cutoff_date.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}',
+                'order': 'timestamp.asc',
+                'limit': '500'  # Small limit for daily data
+            }
+        else:
+            raise HTTPException(status_code=400, detail="Invalid interval. Must be 'hour' or 'day'")
         
         query_string = "&".join([f"{k}={v}" for k, v in params.items()])
         url += f"?{query_string}"
@@ -664,12 +887,13 @@ async def get_restaurant_chart_data(
         
         if response.status_code == 200:
             data = response.json()
+            logger.info(f"Retrieved {len(data)} records for restaurant {restaurant_id} (optimized)")
             
             # Group data by timestamp intervals
             chart_data = []
             
             if interval == "hour":
-                # Group by hour
+                # Group by hour with smart sampling
                 hourly_data = {}
                 for item in data:
                     timestamp = parse_timestamp_robust(item['timestamp'])
@@ -679,8 +903,12 @@ async def get_restaurant_chart_data(
                         hourly_data[hour_key] = []
                     hourly_data[hour_key].append(item)
                 
-                # Calculate metrics for each hour
-                for hour, items in hourly_data.items():
+                # Sample every 2 hours to reduce data points for better performance
+                sampled_hours = sorted(hourly_data.keys())[::2]
+                
+                # Calculate metrics for each sampled hour
+                for hour in sampled_hours:
+                    items = hourly_data[hour]
                     if items:
                         # Find the most recent item with valid popularity data
                         valid_items = [item for item in items if item.get('current_popularity') is not None]
@@ -719,7 +947,7 @@ async def get_restaurant_chart_data(
                     daily_data[day_key].append(item)
                 
                 # Calculate metrics for each day
-                for day, items in daily_data.items():
+                for day, items in sorted(daily_data.items()):
                     if items:
                         # Find the most recent item with valid popularity data
                         valid_items = [item for item in items if item.get('current_popularity') is not None]
@@ -752,7 +980,8 @@ async def get_restaurant_chart_data(
                 "chart_data": chart_data,
                 "period_days": days,
                 "interval": interval,
-                "total_data_points": len(data)
+                "total_data_points": len(data),
+                "optimization": "smart_sampling"
             }
         else:
             logger.error(f"Supabase API error: {response.status_code} - {response.text}")
